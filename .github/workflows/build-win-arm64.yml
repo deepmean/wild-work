@@ -33,13 +33,15 @@ permissions:
   contents: write # 仅 publish 步骤需要（创建/更新 win-arm64-build 预发布）
 
 env:
-  # Windows ARM64 是纯 Go 交叉编译：本仓无 cgo 依赖（DEVELOPMENT.md §5 的硬要求）。
-  # 一旦哪天引入 cgo，CGO_ENABLED=0 会让构建**直接失败**而不是产出跑不起来的二进制，
-  # 这正是我们要的失败方式。
-  GOOS: windows
-  GOARCH: arm64
-  CGO_ENABLED: '0'
   BIN: wild-work-windows-arm64.exe
+
+# ⚠️ 为什么 GOOS/GOARCH/CGO_ENABLED **不放在 job 级 env**：
+# 交叉编译的平台变量会污染「在本机跑的工具」——`go run pkg@version`（本仓用 rsrc
+# 生成图标资源）同样吃这两个变量，于是被编成 Windows ARM64 的可执行文件，在
+# ubuntu runner 上直接 `fork/exec .../rsrc.exe: exec format error`。
+# 首轮 CI 的 exit 127 也是同一根因：编出来的产物名是 rsrc.exe，而脚本找的是 rsrc。
+# 教训：目标平台变量只在「编目标程序」的那两步里用步骤级 env 注入，
+# 绝不在 job 级广播——工具要跑在 runner 自己的架构上。
 
 jobs:
   build-win-arm64:
@@ -67,6 +69,8 @@ jobs:
         run: |
           go version
           go env GOOS GOARCH CGO_ENABLED GOVERSION
+          echo "宿主平台（工具链必须跑在这里）: $(go env GOOS)/$(go env GOARCH)"
+          echo "目标平台（仅在构建步骤注入）: windows/arm64, CGO_ENABLED=0"
 
       - name: 下载依赖
         run: go mod download
@@ -79,11 +83,13 @@ jobs:
       # 与 GOARCH=arm64 一致，可正常链接（本仓已在 Windows ARM64 上实测）。
       #
       # 用 `go run pkg@version` 而不是 `go install` + 猜安装路径：
-      # 首轮实测 go install 退出码 0、但 "$(go env GOPATH)/bin/rsrc" 不存在
-      # （setup-go 注入的 GOPATH 与安装落点不一致），下一行直接 exit 127。
       # go run 的语义是"临时编译并执行"，与 GOBIN/GOPATH 落点无关，最稳。
+      # 前提是本步骤**没有** GOOS/GOARCH 环境变量（见文件顶部 env 的说明）：
+      # 一旦继承，rsrc 会被编成 rsrc.exe（Windows ARM64），runner 上跑不了。
+      # 这里显式再置空一次，防止将来有人在 job/step 级重新广播这两个变量。
       - name: 生成 arm64 图标资源
         run: |
+          unset GOOS GOARCH CGO_ENABLED
           cp build/windows/icon.ico cmd/wild-work/icon.ico
           go run github.com/akavel/rsrc@v0.10.2 \
             -arch arm64 \
@@ -103,10 +109,20 @@ jobs:
 
       # 全包编译检查：先确认**每一个包**都能在 windows/arm64 下编过，
       # 再编主程序。否则单个包失败时，报错会和主程序失败混在一起看不出是哪个包。
+      # CGO_ENABLED=0：本仓无 cgo 依赖（DEVELOPMENT.md §5 的硬要求）。哪天引入 cgo，
+      # 这里会**直接失败**而不是产出一个跑不起来的二进制 —— 这正是想要的失败方式。
       - name: 全包编译检查
+        env:
+          GOOS: windows
+          GOARCH: arm64
+          CGO_ENABLED: '0'
         run: go build ./...
 
       - name: 编译 Windows ARM64
+        env:
+          GOOS: windows
+          GOARCH: arm64
+          CGO_ENABLED: '0'
         run: |
           VERSION="$(awk -F'"' '/^const Version = /{print $2; exit}' internal/app/app.go)"
           echo "上游源码版本: ${VERSION:-未知}"
