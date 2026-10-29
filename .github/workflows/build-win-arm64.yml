@@ -76,15 +76,30 @@ jobs:
       # 会被 Go 构建系统按后缀过滤掉（纯静默：exe 能编出来，只是没有图标）；
       # 所以要显式 -arch arm64 + rsrc_windows_arm64.syso（后缀是 Go 的筛选依据）。
       # -arch arm64 在 rsrc v0.10.2 标 EXPERIMENTAL，产物 COFF Machine 实测为 0xAA64，
-      # 与 GOARCH=arm64 一致，可正常链接（本仓已实测）。
+      # 与 GOARCH=arm64 一致，可正常链接（本仓已在 Windows ARM64 上实测）。
+      #
+      # 用 `go run pkg@version` 而不是 `go install` + 猜安装路径：
+      # 首轮实测 go install 退出码 0、但 "$(go env GOPATH)/bin/rsrc" 不存在
+      # （setup-go 注入的 GOPATH 与安装落点不一致），下一行直接 exit 127。
+      # go run 的语义是"临时编译并执行"，与 GOBIN/GOPATH 落点无关，最稳。
       - name: 生成 arm64 图标资源
         run: |
-          go install github.com/akavel/rsrc@v0.10.2
           cp build/windows/icon.ico cmd/wild-work/icon.ico
-          "$(go env GOPATH)/bin/rsrc" -arch arm64 \
+          go run github.com/akavel/rsrc@v0.10.2 \
+            -arch arm64 \
             -ico cmd/wild-work/icon.ico \
             -o cmd/wild-work/rsrc_windows_arm64.syso
           ls -l cmd/wild-work/rsrc_windows_arm64.syso
+          # syso 是 COFF 对象：头 2 字节就是 Machine（小端），0xAA64 = ARM64。
+          # 这里顺手断言一次，避免"图标资源被生成成 amd64"后静默不生效。
+          python3 - <<'PY'
+          import sys
+          data = open("cmd/wild-work/rsrc_windows_arm64.syso", "rb").read(2)
+          machine = int.from_bytes(data, "little")
+          print(f"syso Machine: 0x{machine:04X}")
+          if machine != 0xAA64:
+              sys.exit(f"FAIL: 图标资源架构 0x{machine:04X} != ARM64(0xAA64)")
+          PY
 
       # 全包编译检查：先确认**每一个包**都能在 windows/arm64 下编过，
       # 再编主程序。否则单个包失败时，报错会和主程序失败混在一起看不出是哪个包。
