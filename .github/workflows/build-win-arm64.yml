@@ -1,39 +1,61 @@
 name: Build Windows ARM64
 
-# 为什么单独一个 workflow，而不是往 build.yml 的矩阵里加一行：
-#   1. build.yml 与「打 tag 发正式版」耦死（release job 会 gh release create 正式 tag），
-#      加一行 arm64 就等于每次发版都多一个必须绿的平台，改别人的发版流程风险不必付；
-#   2. Windows ARM64 只需要 **交叉编译**（纯 Go、CGO_ENABLED=0，见 DEVELOPMENT.md §5），
-#      跑在 ubuntu 上即可，不必占用 macOS/Windows runner；
-#   3. 本 workflow 只认「源码 → 产物」这一条链路：断言的产物必须是 ARM64 原生 PE，
-#      不靠文件名猜（scripts/check-pe.py 读 PE 头 Machine 字段）。
+# ── 这份 workflow 干什么 ─────────────────────────────────────────────
+# 编 **上游 rockswang/wild-work 的源码**（不是本 fork 的代码）成 Windows ARM64
+# 原生 exe，上游一出新 commit 就自动重编，没新 commit 就整条跳过。
 #
-# 产物：dist/wild-work-windows-arm64.exe（+ .sha256）
-# 用法：Actions → Build Windows ARM64 → Run workflow（可填 ref 指定分支/标签/commit）
+# 为什么不是 `on: push` 就够：本仓是 fork，fork 的 master **不会**自动跟随上游，
+# 只有人手动点 "Sync fork" 才会动。所以靠 fork 自身的 push 事件等于靠人手，
+# 上游半夜发版你也得等到白天同步。真正的触发器只能是定时轮询上游 HEAD。
+#
+# 因此三条触发路径：
+#   1. schedule（主力）：每 30 分钟问一次上游 master HEAD，与上次构建记录的
+#      commit 比对，**不同才编译**。GitHub 对 schedule 有排队/延迟（高负载时
+#      实际可能漂到 10~30 分钟后），这是平台行为，不是本 workflow 的时序问题。
+#   2. push（辅助）：本仓 master 被 push（比如你点了 Sync fork）立刻走一遍同样
+#      的判断，省掉一次轮询等待。
+#   3. workflow_dispatch：手动指定 ref 编任意分支/标签/commit；也可 force 重编。
+#
+# 状态记在哪：release `win-arm64-build` 的 body 里埋一行
+#   <!-- built-upstream-sha: <40位sha> -->
+# 构建**成功之后**才写，所以构建失败不会被误记成"已构建"，下一轮 cron 会自动重试。
 
 on:
   workflow_dispatch:
     inputs:
       ref:
-        description: '要编译的分支 / 标签 / commit（留空 = 触发时所在分支）'
+        description: '要编译的上游 分支/标签/commit（留空 = 自动取上游 master HEAD）'
         required: false
         default: ''
+      force:
+        description: '即使上游 commit 与上次构建相同也强制重编'
+        required: false
+        type: boolean
+        default: false
       publish:
-        description: '构建成功后更新 win-arm64-build 预发布（不碰 v* 正式 tag 的 release）'
+        description: '构建成功后更新 win-arm64-build 预发布'
         required: false
         type: boolean
         default: true
+  push:
+    branches: [master]
+    tags: ['v*']
+  schedule:
+    # 每 30 分钟一次。cron 用 UTC，这里刻意错开整点（:07 与 :37）：
+    # 整点是 GitHub 全局排队的最高峰，错开能明显降低被延迟的概率。
+    - cron: '7,37 * * * *'
 
-# 手动触发按钮只在默认分支显示；tag 触发时编译该 tag 的源码
 concurrency:
-  group: build-win-arm64-${{ github.ref }}
+  group: build-win-arm64
   cancel-in-progress: true
 
 permissions:
-  contents: write # 仅 publish 步骤需要（创建/更新 win-arm64-build 预发布）
+  contents: write # 仅发布步骤需要（创建/更新 win-arm64-build 预发布）
 
 env:
   BIN: wild-work-windows-arm64.exe
+  UPSTREAM: rockswang/wild-work
+  TAG: win-arm64-build
 
 # ⚠️ 为什么 GOOS/GOARCH/CGO_ENABLED **不放在 job 级 env**：
 # 交叉编译的平台变量会污染「在本机跑的工具」——`go run pkg@version`（本仓用 rsrc
@@ -44,18 +66,85 @@ env:
 # 绝不在 job 级广播——工具要跑在 runner 自己的架构上。
 
 jobs:
-  build-win-arm64:
+  # ── 1. 判断要不要编 ────────────────────────────────────────────────
+  check:
+    name: 比对上游 commit
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.pick.outputs.sha }}
+      skip: ${{ steps.pick.outputs.skip }}
+    steps:
+      - name: 取上游 HEAD 与上次构建记录
+        id: pick
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+
+          WANT="${{ inputs.ref }}"
+          if [ -z "$WANT" ]; then
+            WANT="$(gh api "repos/${UPSTREAM}/commits/master" --jq .sha)"
+            echo "上游 ${UPSTREAM} master HEAD: $WANT"
+          else
+            echo "手动指定 ref: $WANT"
+          fi
+
+          BUILT=""
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            BUILT="$(gh release view "$TAG" --json body --jq .body 2>/dev/null \
+              | grep -oE 'built-upstream-sha: [0-9a-f]{40}' | head -1 | awk '{print $2}' || true)"
+          fi
+          echo "上次已构建: ${BUILT:-（无记录，将首次构建）}"
+
+          SKIP=false
+          if [ "${{ inputs.force }}" = "true" ]; then
+            echo "force=true，强制重编"
+          elif [ -n "${{ inputs.ref }}" ]; then
+            echo "手动指定了 ref，不做去重"
+          elif [ -n "$BUILT" ] && [ "$BUILT" = "$WANT" ]; then
+            SKIP=true
+            echo "上游没有新 commit，跳过编译"
+          else
+            echo "上游有更新 → 开始编译"
+          fi
+
+          {
+            echo "sha=$WANT"
+            echo "skip=$SKIP"
+          } >> "$GITHUB_OUTPUT"
+
+  # ── 2. 编上游源码 ─────────────────────────────────────────────────
+  build:
     name: windows-arm64
+    needs: check
+    if: needs.check.outputs.skip != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - name: Checkout 源码
+      # 两个 checkout 各有分工，缺一不可：
+      #   build-tools = 本 fork，只为了拿 scripts/check-pe.py（上游没有这个脚本）
+      #   src         = 上游源码，真正要编的东西
+      # 不能只 checkout 上游：断言脚本会 404；也不能只 checkout 本 fork：
+      # 那就变成编 fork 的旧代码，不是"上游源码"了。
+      - name: Checkout 本仓（构建工具）
         uses: actions/checkout@v5
         with:
-          # 手动触发时允许指定 ref（编译历史 tag / 别的分支来复现问题）；
-          # 留空则用触发所在分支，即"上游源码本身"，不依赖任何预编译产物。
-          ref: ${{ inputs.ref || github.ref }}
+          path: build-tools
           fetch-depth: 1
+
+      - name: Checkout 上游源码
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ needs.check.outputs.sha }}
+          path: src
+          fetch-depth: 1
+
+      - name: 记录上游版本
+        run: |
+          echo "上游 commit: ${{ needs.check.outputs.sha }}"
+          git -C src log -1 --format='作者 %an <%ae>%n日期 %ad%n标题 %s' --date=iso
+          git -C src rev-parse HEAD
 
       # go.mod 声明 go 1.25.0；用 1.25.x 取最新补丁版，
       # 不写死 '1.25'（那会装到 1.25.0 这一个具体版本）。
@@ -64,8 +153,10 @@ jobs:
         with:
           go-version: '1.25.x'
           cache: true
+          cache-dependency-path: src/go.sum
 
       - name: 打印工具链
+        working-directory: src
         run: |
           go version
           go env GOOS GOARCH CGO_ENABLED GOVERSION
@@ -73,6 +164,7 @@ jobs:
           echo "目标平台（仅在构建步骤注入）: windows/arm64, CGO_ENABLED=0"
 
       - name: 下载依赖
+        working-directory: src
         run: go mod download
 
       # Windows 图标资源必须**按目标架构**生成。
@@ -88,6 +180,7 @@ jobs:
       # 一旦继承，rsrc 会被编成 rsrc.exe（Windows ARM64），runner 上跑不了。
       # 这里显式再置空一次，防止将来有人在 job/step 级重新广播这两个变量。
       - name: 生成 arm64 图标资源
+        working-directory: src
         run: |
           unset GOOS GOARCH CGO_ENABLED
           cp build/windows/icon.ico cmd/wild-work/icon.ico
@@ -112,6 +205,7 @@ jobs:
       # CGO_ENABLED=0：本仓无 cgo 依赖（DEVELOPMENT.md §5 的硬要求）。哪天引入 cgo，
       # 这里会**直接失败**而不是产出一个跑不起来的二进制 —— 这正是想要的失败方式。
       - name: 全包编译检查
+        working-directory: src
         env:
           GOOS: windows
           GOARCH: arm64
@@ -119,6 +213,7 @@ jobs:
         run: go build ./...
 
       - name: 编译 Windows ARM64
+        working-directory: src
         env:
           GOOS: windows
           GOARCH: arm64
@@ -140,11 +235,11 @@ jobs:
       # 文件名是变量，PE 头才是事实：架构写错不会报错，只会产出一个被 x64
       # 模拟层接走的 exe（能跑、但慢且不是原生），静默且难查。
       - name: 校验产物架构（PE 头断言）
-        run: python3 scripts/check-pe.py "dist/${BIN}" --expect arm64
+        run: python3 build-tools/scripts/check-pe.py "src/dist/${BIN}" --expect arm64
 
       - name: 生成 SHA256
+        working-directory: src/dist
         run: |
-          cd dist
           sha256sum "${BIN}" > "${BIN}.sha256"
           cat "${BIN}.sha256"
 
@@ -153,34 +248,50 @@ jobs:
         with:
           name: wild-work-windows-arm64
           path: |
-            dist/${{ env.BIN }}
-            dist/${{ env.BIN }}.sha256
+            src/dist/${{ env.BIN }}
+            src/dist/${{ env.BIN }}.sha256
           if-no-files-found: error
           retention-days: 30
 
-      # 固定 tag 的预发布：每次覆盖，不堆积。
-      # 刻意**不**往 v* 正式 tag 上挂资产 —— 那是上游 build.yml 的 release job 的地盘，
-      # 两边并行 gh release create/upload 会互相抢同一个 release（时序不定，失败难复现）。
+      # 发布口径：
+      #   - 定时/推送触发（上游有新版）→ 默认更新预发布，让你打开 release 页就是最新
+      #   - 手动触发 → 听 publish 复选框的（有人只想验编译，不想动 release）
+      #
+      # 用 upload --clobber + edit 而不是 delete + create：
+      # 后者每次重建 tag，会把下载计数清零、release id 全变，还会在 tag 列表里闪。
+      # 用 --clobber 原地替换资产，url 稳定。
+      #
+      # body 里那行 `<!-- built-upstream-sha: ... -->` 是下一轮 check 比对用的状态，
+      # 必须**构建成功之后**才写（失败不写 → 下轮自动重试）。
       - name: 更新 win-arm64-build 预发布
-        if: github.event_name == 'workflow_dispatch' && inputs.publish
+        if: github.event_name != 'workflow_dispatch' || inputs.publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="win-arm64-build"
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release delete "$TAG" --yes --cleanup-tag
-          fi
+          set -eu
+          SHA="${{ needs.check.outputs.sha }}"
           cat > /tmp/win-arm64-notes.md <<EOF
-          由上游源码交叉编译：GOOS=windows GOARCH=arm64 CGO_ENABLED=0
-          commit: ${GITHUB_SHA}
+          <!-- built-upstream-sha: ${SHA} -->
+
+          由**上游源码**交叉编译：GOOS=windows GOARCH=arm64 CGO_ENABLED=0
+          上游仓库: ${UPSTREAM}
+          上游 commit: ${SHA}
           版本: ${VERSION:-未知}
+          构建时间: $(date -u '+%Y-%m-%d %H:%M UTC')
 
           适用：Windows 11 on ARM（ARM64 原生，不走 x64 模拟层）。
 
           校验：certutil -hashfile ${BIN} SHA256  → 与 ${BIN}.sha256 对照。
           EOF
-          gh release create "$TAG" \
-            "dist/${BIN}" "dist/${BIN}.sha256" \
-            --prerelease \
-            --title "Windows ARM64 Build ${VERSION:-dev} ($(date '+%Y-%m-%d %H:%M'))" \
-            --notes-file /tmp/win-arm64-notes.md
+
+          TITLE="Windows ARM64 Build ${VERSION:-dev} (upstream ${SHA:0:7})"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "src/dist/${BIN}" "src/dist/${BIN}.sha256" --clobber
+            gh release edit "$TAG" --title "$TITLE" --notes-file /tmp/win-arm64-notes.md
+            echo "已原地更新预发布 $TAG"
+          else
+            gh release create "$TAG" \
+              "src/dist/${BIN}" "src/dist/${BIN}.sha256" \
+              --prerelease --title "$TITLE" --notes-file /tmp/win-arm64-notes.md
+            echo "已创建预发布 $TAG"
+          fi
