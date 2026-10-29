@@ -1,0 +1,155 @@
+name: Build Windows ARM64
+
+# 为什么单独一个 workflow，而不是往 build.yml 的矩阵里加一行：
+#   1. build.yml 与「打 tag 发正式版」耦死（release job 会 gh release create 正式 tag），
+#      加一行 arm64 就等于每次发版都多一个必须绿的平台，改别人的发版流程风险不必付；
+#   2. Windows ARM64 只需要 **交叉编译**（纯 Go、CGO_ENABLED=0，见 DEVELOPMENT.md §5），
+#      跑在 ubuntu 上即可，不必占用 macOS/Windows runner；
+#   3. 本 workflow 只认「源码 → 产物」这一条链路：断言的产物必须是 ARM64 原生 PE，
+#      不靠文件名猜（scripts/check-pe.py 读 PE 头 Machine 字段）。
+#
+# 产物：dist/wild-work-windows-arm64.exe（+ .sha256）
+# 用法：Actions → Build Windows ARM64 → Run workflow（可填 ref 指定分支/标签/commit）
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '要编译的分支 / 标签 / commit（留空 = 触发时所在分支）'
+        required: false
+        default: ''
+      publish:
+        description: '构建成功后更新 win-arm64-build 预发布（不碰 v* 正式 tag 的 release）'
+        required: false
+        type: boolean
+        default: true
+
+# 手动触发按钮只在默认分支显示；tag 触发时编译该 tag 的源码
+concurrency:
+  group: build-win-arm64-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write # 仅 publish 步骤需要（创建/更新 win-arm64-build 预发布）
+
+env:
+  # Windows ARM64 是纯 Go 交叉编译：本仓无 cgo 依赖（DEVELOPMENT.md §5 的硬要求）。
+  # 一旦哪天引入 cgo，CGO_ENABLED=0 会让构建**直接失败**而不是产出跑不起来的二进制，
+  # 这正是我们要的失败方式。
+  GOOS: windows
+  GOARCH: arm64
+  CGO_ENABLED: '0'
+  BIN: wild-work-windows-arm64.exe
+
+jobs:
+  build-win-arm64:
+    name: windows-arm64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout 源码
+        uses: actions/checkout@v4
+        with:
+          # 手动触发时允许指定 ref（编译历史 tag / 别的分支来复现问题）；
+          # 留空则用触发所在分支，即"上游源码本身"，不依赖任何预编译产物。
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 1
+
+      # go.mod 声明 go 1.25.0；用 1.25.x 取最新补丁版，
+      # 不写死 '1.25'（那会装到 1.25.0 这一个具体版本）。
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: true
+
+      - name: 打印工具链
+        run: |
+          go version
+          go env GOOS GOARCH CGO_ENABLED GOVERSION
+
+      - name: 下载依赖
+        run: go mod download
+
+      # Windows 图标资源必须**按目标架构**生成。
+      # rsrc 默认 -arch amd64，产出的 rsrc_windows_amd64.syso 在 GOARCH=arm64 时
+      # 会被 Go 构建系统按后缀过滤掉（纯静默：exe 能编出来，只是没有图标）；
+      # 所以要显式 -arch arm64 + rsrc_windows_arm64.syso（后缀是 Go 的筛选依据）。
+      # -arch arm64 在 rsrc v0.10.2 标 EXPERIMENTAL，产物 COFF Machine 实测为 0xAA64，
+      # 与 GOARCH=arm64 一致，可正常链接（本仓已实测）。
+      - name: 生成 arm64 图标资源
+        run: |
+          go install github.com/akavel/rsrc@v0.10.2
+          cp build/windows/icon.ico cmd/wild-work/icon.ico
+          "$(go env GOPATH)/bin/rsrc" -arch arm64 \
+            -ico cmd/wild-work/icon.ico \
+            -o cmd/wild-work/rsrc_windows_arm64.syso
+          ls -l cmd/wild-work/rsrc_windows_arm64.syso
+
+      # 全包编译检查：先确认**每一个包**都能在 windows/arm64 下编过，
+      # 再编主程序。否则单个包失败时，报错会和主程序失败混在一起看不出是哪个包。
+      - name: 全包编译检查
+        run: go build ./...
+
+      - name: 编译 Windows ARM64
+        run: |
+          VERSION="$(awk -F'"' '/^const Version = /{print $2; exit}' internal/app/app.go)"
+          echo "上游源码版本: ${VERSION:-未知}"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          mkdir -p dist
+          # -H windowsgui：GUI 子系统，双击不弹黑窗（与上游 build.yml 一致）
+          # -trimpath：去掉本机/runner 路径，产物可复现
+          # -buildvcs=false：浅克隆下不写入 VCS stamp，避免无意义的构建差异
+          go build -trimpath -buildvcs=false \
+            -ldflags "-H windowsgui" \
+            -o "dist/${BIN}" ./cmd/wild-work
+          ls -l dist/
+
+      # 断言产物**真的是** ARM64 原生 PE（PE32+ / Machine=0xAA64）。
+      # 文件名是变量，PE 头才是事实：架构写错不会报错，只会产出一个被 x64
+      # 模拟层接走的 exe（能跑、但慢且不是原生），静默且难查。
+      - name: 校验产物架构（PE 头断言）
+        run: python3 scripts/check-pe.py "dist/${BIN}" --expect arm64
+
+      - name: 生成 SHA256
+        run: |
+          cd dist
+          sha256sum "${BIN}" > "${BIN}.sha256"
+          cat "${BIN}.sha256"
+
+      - name: 上传 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wild-work-windows-arm64
+          path: |
+            dist/${{ env.BIN }}
+            dist/${{ env.BIN }}.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      # 固定 tag 的预发布：每次覆盖，不堆积。
+      # 刻意**不**往 v* 正式 tag 上挂资产 —— 那是上游 build.yml 的 release job 的地盘，
+      # 两边并行 gh release create/upload 会互相抢同一个 release（时序不定，失败难复现）。
+      - name: 更新 win-arm64-build 预发布
+        if: github.event_name == 'workflow_dispatch' && inputs.publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="win-arm64-build"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release delete "$TAG" --yes --cleanup-tag
+          fi
+          cat > /tmp/win-arm64-notes.md <<EOF
+          由上游源码交叉编译：GOOS=windows GOARCH=arm64 CGO_ENABLED=0
+          commit: ${GITHUB_SHA}
+          版本: ${VERSION:-未知}
+
+          适用：Windows 11 on ARM（ARM64 原生，不走 x64 模拟层）。
+
+          校验：certutil -hashfile ${BIN} SHA256  → 与 ${BIN}.sha256 对照。
+          EOF
+          gh release create "$TAG" \
+            "dist/${BIN}" "dist/${BIN}.sha256" \
+            --prerelease \
+            --title "Windows ARM64 Build ${VERSION:-dev} ($(date '+%Y-%m-%d %H:%M'))" \
+            --notes-file /tmp/win-arm64-notes.md

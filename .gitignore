@@ -1,6 +1,9 @@
 # 编译产物
 dist/
 cmd/wild-work/rsrc_windows_amd64.syso
+# arm64 的图标资源由 .github/workflows/build-win-arm64.yml 在 CI 里现场生成，
+# 不入库（syso 是二进制，且必须按目标架构生成，提交上来只会误导）
+cmd/wild-work/rsrc_windows_arm64.syso
 cmd/wild-work/icon.ico
 
 # 运行时数据（含敏感凭据）
