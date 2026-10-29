@@ -23,6 +23,10 @@ MACHINE = {
     0x01C4: "arm",
 }
 
+# 名字 → Machine 值。MACHINE 的键是整数，别拿架构名去查它
+# （CI 首跑就踩了：`"arm64" in MACHINE` 恒 False，断言直接被判成"参数非法"）。
+BY_NAME = {name: code for code, name in MACHINE.items()}
+
 PE32_PLUS = 0x20B
 PE32 = 0x10B
 
@@ -90,9 +94,8 @@ def main() -> int:
         fail(f"体积 {size:,} 小于下限 {min_bytes:,}，疑似构建不完整")
 
     if expect is not None:
-        want = MACHINE.get(expect) if expect in MACHINE else None
-        if want is None:
-            fail(f"--expect 取值非法: {expect}")
+        if expect not in BY_NAME:
+            fail(f"--expect 取值非法: {expect}（可选 {'/'.join(BY_NAME)}）")
         if arch != expect:
             fail(f"架构不符: 期望 {expect}，实际 {arch}")
         print(f"断言通过  : 产物确实是 {expect}")
