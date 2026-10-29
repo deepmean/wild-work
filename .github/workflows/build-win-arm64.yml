@@ -50,7 +50,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout 源码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           # 手动触发时允许指定 ref（编译历史 tag / 别的分支来复现问题）；
           # 留空则用触发所在分支，即"上游源码本身"，不依赖任何预编译产物。
@@ -60,7 +60,7 @@ jobs:
       # go.mod 声明 go 1.25.0；用 1.25.x 取最新补丁版，
       # 不写死 '1.25'（那会装到 1.25.0 这一个具体版本）。
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: '1.25.x'
           cache: true
@@ -149,7 +149,7 @@ jobs:
           cat "${BIN}.sha256"
 
       - name: 上传 artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: wild-work-windows-arm64
           path: |
