@@ -234,7 +234,7 @@ APP_NEW_ROUTE = (
     "\t\t\t_ = os.Remove(name)\n"
     "\t\t\treturn \"可写\"\n"
     "\t\t}\n"
-    "\t\twriteJSON(w, http.StatusOK, map[string]any{\n"
+    "\t\tresp := map[string]any{\n"
     "\t\t\t\"cwd\":             wd,\n"
     "\t\t\t\"exe\":             exePath,\n"
     "\t\t\t\"state_file\":      a.cfg.StateFile,\n"
@@ -250,9 +250,131 @@ APP_NEW_ROUTE = (
     "\t\t\t\"probe_exe_dir\":   probe(filepath.Dir(exePath)),\n"
     "\t\t\t\"probe_data_dir\":  probe(filepath.Dir(logFP)),\n"
     "\t\t\t\"probe_temp\":      probe(os.TempDir()),\n"
-    "\t\t})\n"
+    "\t\t}\n"
+    "\t\t// 令牌信息：三个互不相关的位置同时被拒，说明不是目录权限问题，\n"
+    "\t\t// 而是进程本身受限（典型是低完整性级别能读不能写）。\n"
+    "\t\tfor k, v := range tokenDiag() {\n"
+    "\t\t\tresp[k] = v\n"
+    "\t\t}\n"
+    "\t\twriteJSON(w, http.StatusOK, resp)\n"
     "\t})\n"
 )
+
+
+# 令牌自检：新建两个文件（Windows 实现 + 其他平台空实现）。
+# 单独成文件而不是塞进 app.go：既不污染上游逻辑，也避免在非 Windows 构建里
+# 引用 syscall 的 Windows 专属类型。
+DIAG_WINDOWS_GO = '''//go:build windows
+
+package app
+
+import (
+\t"syscall"
+\t"unsafe"
+)
+
+// tokenDiag 报告当前进程令牌的关键属性。
+//
+// 为什么需要：ARM64 构建出现「exe 目录 / data 目录 / %TEMP% 三处写入同时
+// Access is denied，而同一用户用 cmd/python 写同一路径都成功」。目录 ACL、
+// MOTW、DENY 条目、Smart App Control 均已排除，剩下唯一能解释「能读不能写」
+// 的就是进程令牌受限——低完整性级别（Low IL）对 Medium 对象可读不可写。
+// 这里把 IL、AppContainer 标志、提升类型、受限令牌标志如实报出来。
+func tokenDiag() map[string]any {
+\tout := map[string]any{}
+
+\ttok, err := syscall.OpenCurrentProcessToken()
+\tif err != nil {
+\t\tout["token_error"] = err.Error()
+\t\treturn out
+\t}
+\tdefer func() { _ = tok.Close() }()
+
+\tadvapi := syscall.NewLazyDLL("advapi32.dll")
+\tgetInfo := advapi.NewProc("GetTokenInformation")
+
+\t// TokenIntegrityLevel = 25
+\tvar need uint32
+\t_, _, _ = getInfo.Call(uintptr(tok), 25, 0, 0, uintptr(unsafe.Pointer(&need)))
+\tif need == 0 {
+\t\tout["integrity"] = "query_size_zero"
+\t} else {
+\t\tbuf := make([]byte, need)
+\t\tr, _, lastErr := getInfo.Call(
+\t\t\tuintptr(tok), 25,
+\t\t\tuintptr(unsafe.Pointer(&buf[0])), uintptr(need),
+\t\t\tuintptr(unsafe.Pointer(&need)),
+\t\t)
+\t\tif r == 0 {
+\t\t\tout["integrity"] = "query_failed: " + lastErr.Error()
+\t\t} else {
+\t\t\t// TOKEN_MANDATORY_LABEL { SID_AND_ATTRIBUTES { PSID Sid; DWORD Attributes } }
+\t\t\t// SID 布局：Revision(1) Count(1) Authority(6) SubAuthority[](4*n)
+\t\t\t// 完整性级别取最后一个 SubAuthority。
+\t\t\tsidPtr := *(*uintptr)(unsafe.Pointer(&buf[0]))
+\t\t\tif sidPtr == 0 {
+\t\t\t\tout["integrity"] = "nil_sid"
+\t\t\t} else {
+\t\t\t\tp := unsafe.Pointer(sidPtr)
+\t\t\t\tcount := *(*byte)(unsafe.Add(p, 1))
+\t\t\t\tif count == 0 {
+\t\t\t\t\tout["integrity"] = "zero_subauthority"
+\t\t\t\t} else {
+\t\t\t\t\trid := *(*uint32)(unsafe.Add(p, 8+int(count-1)*4))
+\t\t\t\t\tout["integrity_rid_hex"] = rid
+\t\t\t\t\tswitch rid {
+\t\t\t\t\tcase 0x0000:
+\t\t\t\t\t\tout["integrity"] = "Untrusted"
+\t\t\t\t\tcase 0x1000:
+\t\t\t\t\t\tout["integrity"] = "Low"
+\t\t\t\t\tcase 0x2000:
+\t\t\t\t\t\tout["integrity"] = "Medium"
+\t\t\t\t\tcase 0x2100:
+\t\t\t\t\t\tout["integrity"] = "MediumPlus"
+\t\t\t\t\tcase 0x3000:
+\t\t\t\t\t\tout["integrity"] = "High"
+\t\t\t\t\tcase 0x4000:
+\t\t\t\t\t\tout["integrity"] = "System"
+\t\t\t\t\tdefault:
+\t\t\t\t\t\tout["integrity"] = "other"
+\t\t\t\t\t}
+\t\t\t\t}
+\t\t\t}
+\t\t}
+\t}
+
+\t// TokenIsAppContainer = 29
+\tvar isAC uint32
+\tvar sz uint32 = 4
+\tif r, _, _ := getInfo.Call(uintptr(tok), 29, uintptr(unsafe.Pointer(&isAC)), 4, uintptr(unsafe.Pointer(&sz))); r != 0 {
+\t\tout["is_app_container"] = isAC != 0
+\t}
+
+\t// TokenElevationType = 18  (1=default 2=full 3=limited)
+\tvar et uint32
+\tsz = 4
+\tif r, _, _ := getInfo.Call(uintptr(tok), 18, uintptr(unsafe.Pointer(&et)), 4, uintptr(unsafe.Pointer(&sz))); r != 0 {
+\t\tout["elevation_type"] = et
+\t}
+
+\t// TokenIsRestricted = 40
+\tvar restricted uint32
+\tsz = 4
+\tif r, _, _ := getInfo.Call(uintptr(tok), 40, uintptr(unsafe.Pointer(&restricted)), 4, uintptr(unsafe.Pointer(&sz))); r != 0 {
+\t\tout["is_restricted"] = restricted != 0
+\t}
+
+\treturn out
+}
+'''
+
+DIAG_OTHER_GO = '''//go:build !windows
+
+package app
+
+// tokenDiag 非 Windows 平台没有令牌概念，返回空表保持 /api/diag 结构一致。
+func tokenDiag() map[string]any { return map[string]any{} }
+'''
 
 
 def patch_platform(root: pathlib.Path) -> None:
@@ -321,6 +443,17 @@ def patch_diag(root: pathlib.Path) -> None:
     p = root / "internal" / "app" / "app.go"
     if not p.is_file():
         sys.exit(f"FAIL: 文件不存在 {p}")
+
+    # 0) 令牌自检文件先落盘（不依赖 app.go 的状态，保证幂等时也补齐）
+    pwin = root / "internal" / "app" / "diag_token_windows.go"
+    pother = root / "internal" / "app" / "diag_token_other.go"
+    if not pwin.exists():
+        pwin.write_text(DIAG_WINDOWS_GO, encoding="utf-8")
+        print("  [已改] app/diag_token_windows.go: 新增令牌自检（IL/AppContainer/受限）")
+    if not pother.exists():
+        pother.write_text(DIAG_OTHER_GO, encoding="utf-8")
+        print("  [已改] app/diag_token_other.go: 非 Windows 空实现")
+
     text = p.read_text(encoding="utf-8")
 
     if "logDiag" in text:
