@@ -43,3 +43,7 @@ Thumbs.db
 github_token.txt
 HANDOFF.md
 GO多平台发布备忘.md
+
+# 本地签名私钥（只上传到 GitHub Secrets，绝不入库）
+.signing/
+*.pfx

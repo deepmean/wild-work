@@ -127,15 +127,21 @@ jobs:
     timeout-minutes: 30
     steps:
       # 两个 checkout 各有分工，缺一不可：
-      #   build-tools = 本 fork，只为了拿 scripts/check-pe.py（上游没有这个脚本）
-      #   src         = 上游源码，真正要编的东西
-      # 不能只 checkout 上游：断言脚本会 404；也不能只 checkout 本 fork：
-      # 那就变成编 fork 的旧代码，不是"上游源码"了。
-      - name: Checkout 本仓（构建工具）
+      #   build-tools = 本 fork，**只**为了拿工具脚本（断言 + 补丁）。sparse-checkout
+      #                 限定到 scripts/ 与 patches/，一个源码文件都不取。
+      #   src         = 上游源码，真正要编的东西，永远直连 rockswang/wild-work。
+      #
+      # 这样 fork 仓库里从来不需要保存上游代码：同步不同步都无所谓，
+      # fork 只承担「CI 配置 + 构建工具 + 运行期补丁」三件事。
+      - name: Checkout 本仓（仅构建工具脚本）
         uses: actions/checkout@v5
         with:
           path: build-tools
           fetch-depth: 1
+          sparse-checkout: |
+            scripts
+            patches
+          sparse-checkout-cone-mode: false
 
       - name: Checkout 上游源码
         uses: actions/checkout@v5
@@ -144,6 +150,14 @@ jobs:
           ref: ${{ needs.check.outputs.sha }}
           path: src
           fetch-depth: 1
+
+      # 上游修复必须在这里落地：上游 v2.11.1 的 OpenURL 仍是
+      # `rundll32 url.dll,FileProtocolHandler`（先在 %TEMP% 落临时文件再转交外壳），
+      # %TEMP% 不可写时面板里所有链接全部点不开。补丁脚本按函数锚点匹配，
+      # 幂等、失败即报错（绝不静默产出一个没修过的二进制）。
+      - name: 应用 Windows 运行期修复补丁
+        run: python3 build-tools/patches/apply-windows-fixes.py src
+
 
       - name: 记录上游版本
         run: |
@@ -242,6 +256,56 @@ jobs:
       - name: 校验产物架构（PE 头断言）
         run: python3 build-tools/scripts/check-pe.py "src/dist/${BIN}" --expect arm64
 
+      # 代码签名：消除「无法验证发布者」弹窗。
+      #
+      # 自签名证书做不到「像正版软件一样零提示」——它只能证明「这个 exe 由这把
+      # 证书签的、且签名后没被改过」。真正让 Windows 不再警告，还需要在目标机器上
+      # 把 certs/WildWork-Local.cer 导入「受信任的根证书颁发机构」一次（见 README 说明）。
+      #
+      # 私钥走 GitHub Secrets（SIGNING_PFX_B64 / SIGNING_PFX_PASS），**不进仓库**。
+      # 没配 secret 就跳过签名，构建照常成功——签名是增强，不是构建前提。
+      - name: 代码签名（未配置 secret 则跳过）
+        id: sign
+        env:
+          PFX_B64: ${{ secrets.SIGNING_PFX_B64 }}
+          PFX_PASS: ${{ secrets.SIGNING_PFX_PASS }}
+        run: |
+          set -eu
+          if [ -z "${PFX_B64:-}" ]; then
+            echo "未配置 SIGNING_PFX_B64，跳过签名（产物保持未签名）"
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! command -v osslsigncode >/dev/null 2>&1; then
+            echo "安装 osslsigncode…"
+            sudo apt-get update -qq && sudo apt-get install -y -qq osslsigncode
+          fi
+          umask 077
+          printf '%s' "$PFX_B64" | base64 -d > /tmp/sign.pfx
+          cd src/dist
+          # -t 时间戳：让签名在证书过期后仍有效。DigiCert 的免费 RFC3161 端点，
+          # 拿不到就退回不签名（不是构建失败）——离线环境下不该卡住整条流水线。
+          if osslsigncode sign \
+               -pkcs12 /tmp/sign.pfx -pass "$PFX_PASS" \
+               -n "wild-work" -i "WildWork Local Build" \
+               -h sha256 -t http://timestamp.digicert.com \
+               -in "${BIN}" -out "${BIN}.signed"; then
+            mv "${BIN}.signed" "${BIN}"
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+            osslsigncode verify "${BIN}" || true
+          else
+            echo "::warning::签名失败（多半是时间戳服务器不可达），产物保持未签名"
+            rm -f "${BIN}.signed"
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+          fi
+          rm -f /tmp/sign.pfx
+
+      # 签名改写了文件，架构断言必须再跑一次（签名工具理论上不会改 Machine，
+      # 但「理论上」不该作为发布依据）。
+      - name: 签名后复验架构
+        if: steps.sign.outputs.signed == 'true'
+        run: python3 build-tools/scripts/check-pe.py "src/dist/${BIN}" --expect arm64
+
       - name: 生成 SHA256
         working-directory: src/dist
         run: |
@@ -255,6 +319,7 @@ jobs:
           path: |
             src/dist/${{ env.BIN }}
             src/dist/${{ env.BIN }}.sha256
+            build-tools/certs/WildWork-Local.cer
           if-no-files-found: error
           retention-days: 30
 
@@ -275,9 +340,15 @@ jobs:
           # 同 check job：两个 checkout 都在子目录（build-tools/ 与 src/），
           # 工作区根目录没有 .git，gh 无从推断仓库 → 必须显式指定。
           GH_REPO: ${{ github.repository }}
+          SIGNED: ${{ steps.sign.outputs.signed }}
         run: |
           set -eu
           SHA="${{ needs.check.outputs.sha }}"
+          if [ "${SIGNED:-false}" = "true" ]; then
+            SIGN_LINE="已用自签名证书签名（证书：WildWork-Local.cer）"
+          else
+            SIGN_LINE="未签名（首次运行可能提示「无法验证发布者」，点「更多信息 → 仍要运行」）"
+          fi
           cat > /tmp/win-arm64-notes.md <<EOF
           <!-- built-upstream-sha: ${SHA} -->
 
@@ -286,20 +357,31 @@ jobs:
           上游 commit: ${SHA}
           版本: ${VERSION:-未知}
           构建时间: $(date -u '+%Y-%m-%d %H:%M UTC')
+          签名: ${SIGN_LINE}
 
           适用：Windows 11 on ARM（ARM64 原生，不走 x64 模拟层）。
+
+          ### 关于「无法验证发布者」
+          这是未受信任签名的正常提示，不是文件损坏。任选其一：
+          1. 直接点「更多信息」→「仍要运行」（每次可能都提示）
+          2. 一次性消除：下载 WildWork-Local.cer → 右键「安装证书」→
+             位置选「本地计算机」→「把所有证书放入下列存储」→ 浏览 →
+             「受信任的根证书颁发机构」→ 完成。之后重新下载 exe 即可（**必须先导入证书，
+             再下载 exe**：文件带 Mark-of-the-Web，顺序反了要重新下载一次才生效）。
 
           校验：certutil -hashfile ${BIN} SHA256  → 与 ${BIN}.sha256 对照。
           EOF
 
           TITLE="Windows ARM64 Build ${VERSION:-dev} (upstream ${SHA:0:7})"
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "src/dist/${BIN}" "src/dist/${BIN}.sha256" --clobber
+            gh release upload "$TAG" "src/dist/${BIN}" "src/dist/${BIN}.sha256" \
+              "build-tools/certs/WildWork-Local.cer" --clobber
             gh release edit "$TAG" --title "$TITLE" --notes-file /tmp/win-arm64-notes.md
             echo "已原地更新预发布 $TAG"
           else
             gh release create "$TAG" \
               "src/dist/${BIN}" "src/dist/${BIN}.sha256" \
+              "build-tools/certs/WildWork-Local.cer" \
               --prerelease --title "$TITLE" --notes-file /tmp/win-arm64-notes.md
             echo "已创建预发布 $TAG"
           fi
