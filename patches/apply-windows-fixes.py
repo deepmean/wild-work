@@ -152,6 +152,109 @@ func dirWritable(dir string) bool {
 '''
 
 
+# ── 修复 3（诊断）：app.go 暴露路径/权限自检 ──────────────────────────
+#
+# 为什么需要：ARM64 构建出现过「进程能正常服务 HTTP、能连上游，但 data/
+# 一个字节都写不进（日志、CDP 临时 profile 全失败）」，而用 cmd/python 以
+# 同一用户写同一路径都成功。外部猜测（ACL、SmartScreen、完整性级别、计划
+# 任务令牌）已逐一排除，剩下的只能由程序自己报告它看到的路径与错误码。
+
+APP_OLD_FIELD = "\tlogFile *os.File\n"
+
+APP_NEW_FIELD = (
+    "\tlogFile *os.File\n"
+    "\n"
+    "\t// logDiag 日志初始化的真实结果（含 cwd/exe/路径/错误），经 GET /api/diag 暴露。\n"
+    "\t// 动机：ARM64 构建出现「程序能跑但一个字节都写不进 data/」，而同一路径\n"
+    "\t// 用 cmd/python 以同一用户写都成功——必须在程序内部取证，不能继续外部猜。\n"
+    "\tlogDiag string\n"
+)
+
+APP_OLD_LOGINIT = (
+    "\t// 日志文件 data/app.log\n"
+    "\tlogFP := filepath.Join(filepath.Dir(opts.Config.StateFile), \"app.log\")\n"
+    "\tif err := os.MkdirAll(filepath.Dir(logFP), 0o755); err == nil {\n"
+    "\t\tf, err := os.OpenFile(logFP, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)\n"
+    "\t\tif err == nil {\n"
+    "\t\t\ta.logFile = f\n"
+    "\t\t}\n"
+    "\t}\n"
+)
+
+APP_NEW_LOGINIT = (
+    "\t// 日志文件 data/app.log（同时记录初始化结果，供 GET /api/diag 取证）\n"
+    "\tlogFP := filepath.Join(filepath.Dir(opts.Config.StateFile), \"app.log\")\n"
+    "\t{\n"
+    "\t\tabs := logFP\n"
+    "\t\tif p, err := filepath.Abs(logFP); err == nil {\n"
+    "\t\t\tabs = p\n"
+    "\t\t}\n"
+    "\t\twd, _ := os.Getwd()\n"
+    "\t\texePath, _ := os.Executable()\n"
+    "\t\tdiag := fmt.Sprintf(\"cwd=%s | exe=%s | stateFile=%s | logFP=%s | abs=%s\",\n"
+    "\t\t\twd, exePath, opts.Config.StateFile, logFP, abs)\n"
+    "\t\tif err := os.MkdirAll(filepath.Dir(logFP), 0o755); err != nil {\n"
+    "\t\t\tdiag += \" | MkdirAll_FAIL: \" + err.Error()\n"
+    "\t\t} else if f, err := os.OpenFile(logFP, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err != nil {\n"
+    "\t\t\tdiag += \" | OpenFile_FAIL: \" + err.Error()\n"
+    "\t\t} else {\n"
+    "\t\t\ta.logFile = f\n"
+    "\t\t\tdiag += \" | OpenFile_OK\"\n"
+    "\t\t}\n"
+    "\t\ta.logDiag = diag\n"
+    "\t}\n"
+)
+
+APP_OLD_ROUTE = '\tmux.HandleFunc("GET /api/logs", func(w http.ResponseWriter, r *http.Request) {\n'
+
+APP_NEW_ROUTE = (
+    "\t// GET /api/diag：运行期路径与写权限自检（只读、无副作用、不含任何凭据）。\n"
+    "\t// 用于定位「进程能跑但写不进 data/」这类只能由程序自身回答的问题。\n"
+    '\tmux.HandleFunc("GET /api/diag", func(w http.ResponseWriter, r *http.Request) {\n'
+    "\t\twd, _ := os.Getwd()\n"
+    "\t\texePath, _ := os.Executable()\n"
+    "\t\tlogFP := filepath.Join(filepath.Dir(a.cfg.StateFile), \"app.log\")\n"
+    "\t\tabs := logFP\n"
+    "\t\tif p, err := filepath.Abs(logFP); err == nil {\n"
+    "\t\t\tabs = p\n"
+    "\t\t}\n"
+    "\t\tprobe := func(dir string) string {\n"
+    "\t\t\tif dir == \"\" {\n"
+    "\t\t\t\treturn \"空路径\"\n"
+    "\t\t\t}\n"
+    "\t\t\tif err := os.MkdirAll(dir, 0o755); err != nil {\n"
+    "\t\t\t\treturn \"MkdirAll失败: \" + err.Error()\n"
+    "\t\t\t}\n"
+    "\t\t\tf, err := os.CreateTemp(dir, \".diag-*\")\n"
+    "\t\t\tif err != nil {\n"
+    "\t\t\t\treturn \"写探针失败: \" + err.Error()\n"
+    "\t\t\t}\n"
+    "\t\t\tname := f.Name()\n"
+    "\t\t\t_ = f.Close()\n"
+    "\t\t\t_ = os.Remove(name)\n"
+    "\t\t\treturn \"可写\"\n"
+    "\t\t}\n"
+    "\t\twriteJSON(w, http.StatusOK, map[string]any{\n"
+    "\t\t\t\"cwd\":             wd,\n"
+    "\t\t\t\"exe\":             exePath,\n"
+    "\t\t\t\"state_file\":      a.cfg.StateFile,\n"
+    "\t\t\t\"log_fp\":          logFP,\n"
+    "\t\t\t\"log_fp_abs\":      abs,\n"
+    "\t\t\t\"log_init\":        a.logDiag,\n"
+    "\t\t\t\"log_file_open\":   a.logFile != nil,\n"
+    "\t\t\t\"os_temp_dir\":     os.TempDir(),\n"
+    "\t\t\t\"env_tmp\":         os.Getenv(\"TMP\"),\n"
+    "\t\t\t\"env_temp\":        os.Getenv(\"TEMP\"),\n"
+    "\t\t\t\"env_localapp\":    os.Getenv(\"LOCALAPPDATA\"),\n"
+    "\t\t\t\"env_userprofile\": os.Getenv(\"USERPROFILE\"),\n"
+    "\t\t\t\"probe_exe_dir\":   probe(filepath.Dir(exePath)),\n"
+    "\t\t\t\"probe_data_dir\":  probe(filepath.Dir(logFP)),\n"
+    "\t\t\t\"probe_temp\":      probe(os.TempDir()),\n"
+    "\t\t})\n"
+    "\t})\n"
+)
+
+
 def patch_platform(root: pathlib.Path) -> None:
     p = root / "internal" / "platform" / "platform_windows.go"
     if not p.is_file():
@@ -214,6 +317,47 @@ def patch_cdp(root: pathlib.Path) -> None:
     print("  [已改] cdp/browser.go: 临时 profile → 多候选 tempBaseDir（带失败路径自证）")
 
 
+def patch_diag(root: pathlib.Path) -> None:
+    p = root / "internal" / "app" / "app.go"
+    if not p.is_file():
+        sys.exit(f"FAIL: 文件不存在 {p}")
+    text = p.read_text(encoding="utf-8")
+
+    if "logDiag" in text:
+        print("  [跳过] app.go 已含 logDiag 诊断")
+        return
+
+    if '"fmt"' not in text:
+        sys.exit("FAIL: app.go 缺少 fmt import，诊断补丁无法拼接字符串。")
+
+    # 1) 结构体加字段
+    if APP_OLD_FIELD not in text:
+        sys.exit(
+            "FAIL: app.go 的 logFile 字段锚点未找到。\n"
+            "请更新 patches/apply-windows-fixes.py 的 APP_OLD_FIELD。"
+        )
+    text = text.replace(APP_OLD_FIELD, APP_NEW_FIELD, 1)
+
+    # 2) 日志初始化块改成带诊断
+    if APP_OLD_LOGINIT not in text:
+        sys.exit(
+            "FAIL: app.go 的日志初始化锚点未找到。\n"
+            "请更新 patches/apply-windows-fixes.py 的 APP_OLD_LOGINIT。"
+        )
+    text = text.replace(APP_OLD_LOGINIT, APP_NEW_LOGINIT, 1)
+
+    # 3) 新增 /api/diag 端点（挂在 /api/logs 之前）
+    if APP_OLD_ROUTE not in text:
+        sys.exit(
+            "FAIL: app.go 的 /api/logs 路由锚点未找到。\n"
+            "请更新 patches/apply-windows-fixes.py 的 APP_OLD_ROUTE。"
+        )
+    text = text.replace(APP_OLD_ROUTE, APP_NEW_ROUTE + APP_OLD_ROUTE, 1)
+
+    p.write_text(text, encoding="utf-8")
+    print("  [已改] app.go: 日志初始化带诊断 + 新增 GET /api/diag")
+
+
 def main() -> int:
     if len(sys.argv) != 2:
         sys.exit("用法: apply-windows-fixes.py <源码根目录>")
@@ -224,6 +368,7 @@ def main() -> int:
     print(f"对 {root} 应用 Windows 修复补丁：")
     patch_platform(root)
     patch_cdp(root)
+    patch_diag(root)
     print("补丁应用完成。")
     return 0
 
