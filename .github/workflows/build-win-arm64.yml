@@ -138,9 +138,13 @@ jobs:
         with:
           path: build-tools
           fetch-depth: 1
+          # certs/ 必须一起取：签名后的公钥证书要作为 release 资产发给用户导入。
+          # 漏了它 → `gh release upload ... certs/WildWork-Local.cer` 报
+          # "no matches found"，发布步骤整体失败（编译本身已经成功）。
           sparse-checkout: |
             scripts
             patches
+            certs
           sparse-checkout-cone-mode: false
 
       - name: Checkout 上游源码
