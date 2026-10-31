@@ -395,15 +395,18 @@ jobs:
           适用：Windows 11 on ARM（ARM64 原生，不走 x64 模拟层）。
 
           ### 本版修复（相对上游 v2.11.1）
-          1. **面板链接点不开 / 提示「无权限在 %TEMP% 目录创建文件」**
-             上游 \`OpenURL\` 用 \`rundll32 url.dll,FileProtocolHandler\`，会先在
-             %TEMP% 落临时文件再转交外壳；%TEMP% 不可写时浏览器起不来，而且
-             \`cmd.Start()\` 不检查 rundll32 是否真成功，面板表现为「点了没反应」。
-             本版改用 \`shell32!ShellExecuteW\`，全程不落盘，并按返回值如实报错。
-          2. **渠道登录失败：\`cdp: 创建临时 profile 失败 … Access is denied\`**
-             CDP 临时 profile 改为多候选：\`<exe目录>/data/tmp\` →
-             \`%LOCALAPPDATA%\\WildWork\\tmp\` → 系统临时目录；错误信息会列出
-             **实际试过且不可写**的候选路径，方便定位。
+          **面板链接点不开**：上游 \`OpenURL\` 用 \`rundll32 url.dll,FileProtocolHandler\`，
+          会先在 %TEMP% 落临时文件再转交外壳；%TEMP% 不可写时浏览器起不来。更隐蔽的是
+          \`cmd.Start()\` 不检查 rundll32 是否真成功，面板表现为「点了没反应」而非报错。
+          本版改用 \`shell32!ShellExecuteW\`，全程不落盘，并按返回值如实报错。
+
+          ### ⚠️ 从非默认位置复制本 exe 时请注意
+          如果这个 exe 曾被放进带**完整性标签**的目录（例如某些沙箱/受限工作区）再复制出来，
+          Windows 会把标签一起带过去，从它启动的进程会变成「低完整性级别」——
+          表现为**程序能跑，但日志、临时目录、渠道登录全部 Access is denied**。
+          本页下载的文件不带该标签；若仍遇到上述症状，执行一次即可：
+
+              icacls "本机路径\\wild-work-windows-arm64.exe" /setintegritylevel Medium
 
           ### 关于「无法验证发布者」
           这是未受信任签名的正常提示，不是文件损坏。任选其一：
