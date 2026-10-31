@@ -72,16 +72,24 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       sha: ${{ steps.pick.outputs.sha }}
+      patches: ${{ steps.pick.outputs.patches }}
       skip: ${{ steps.pick.outputs.skip }}
     steps:
+      # 只为算 patches/ 的哈希（去重键的一部分），sparse 到最小。
+      - name: Checkout 补丁目录（仅算哈希）
+        uses: actions/checkout@v5
+        with:
+          path: build-tools
+          fetch-depth: 1
+          sparse-checkout: patches
+          sparse-checkout-cone-mode: false
+
       - name: 取上游 HEAD 与上次构建记录
         id: pick
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # 本 job **没有** checkout（只做 API 比对，没必要拉代码），所以根目录不是
-          # git 仓库；gh 默认靠 git 上下文推断仓库，会报 "not a git repository"。
-          # 必须显式给 GH_REPO，否则 `gh release view` 恒失败 → 它被 `2>/dev/null`
-          # 吞掉后表现为"永远没有构建记录" → 每 30 分钟重复编一次同一个 commit。
+          # 本 job 只 sparse checkout patches/（算补丁哈希），根目录仍不是 git 仓库，
+          # gh 无从推断仓库；不显式给 GH_REPO 会报 "not a git repository"。
           GH_REPO: ${{ github.repository }}
         run: |
           set -eu
@@ -94,27 +102,46 @@ jobs:
             echo "手动指定 ref: $WANT"
           fi
 
+          # 补丁自身的哈希也进去重键。
+          # 为什么必须：上游 commit 没变、但我们改了 patches/ 里的修复脚本时，
+          # 只比对 upstream-sha 会判定"没有新 commit → 跳过"，于是永远发不出
+          # 打了新补丁的产物（用户只能拿到旧版本，还以为修复没生效）。
+          # 把 patches/ 全部文件排序后整体哈希，任一处改动都会触发重编。
+          PATCH_HASH="$(find build-tools/patches -type f -name '*' -print0 \
+            | sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)"
+          echo "本次补丁哈希: $PATCH_HASH"
+
           BUILT=""
+          BUILT_PATCH=""
           if gh release view "$TAG" >/dev/null 2>&1; then
-            BUILT="$(gh release view "$TAG" --json body --jq .body 2>/dev/null \
+            BODY="$(gh release view "$TAG" --json body --jq .body 2>/dev/null || true)"
+            BUILT="$(printf '%s' "$BODY" \
               | grep -oE 'built-upstream-sha: [0-9a-f]{40}' | head -1 | awk '{print $2}' || true)"
+            BUILT_PATCH="$(printf '%s' "$BODY" \
+              | grep -oE 'built-patches-hash: [0-9a-f]{64}' | head -1 | awk '{print $2}' || true)"
           fi
-          echo "上次已构建: ${BUILT:-（无记录，将首次构建）}"
+          echo "上次已构建 commit: ${BUILT:-（无记录）}"
+          echo "上次已构建补丁:   ${BUILT_PATCH:-（无记录）}"
 
           SKIP=false
           if [ "${{ inputs.force }}" = "true" ]; then
             echo "force=true，强制重编"
           elif [ -n "${{ inputs.ref }}" ]; then
             echo "手动指定了 ref，不做去重"
-          elif [ -n "$BUILT" ] && [ "$BUILT" = "$WANT" ]; then
-            SKIP=true
-            echo "上游没有新 commit，跳过编译"
+          elif [ -z "$BUILT" ]; then
+            echo "没有构建记录 → 开始编译"
+          elif [ "$BUILT" != "$WANT" ]; then
+            echo "上游有新 commit → 开始编译"
+          elif [ "$BUILT_PATCH" != "$PATCH_HASH" ]; then
+            echo "上游未变，但补丁已更新 → 重新编译"
           else
-            echo "上游有更新 → 开始编译"
+            SKIP=true
+            echo "上游 commit 与补丁哈希都没变，跳过编译"
           fi
 
           {
             echo "sha=$WANT"
+            echo "patches=$PATCH_HASH"
             echo "skip=$SKIP"
           } >> "$GITHUB_OUTPUT"
 
@@ -355,23 +382,40 @@ jobs:
           fi
           cat > /tmp/win-arm64-notes.md <<EOF
           <!-- built-upstream-sha: ${SHA} -->
+          <!-- built-patches-hash: ${{ needs.check.outputs.patches }} -->
 
           由**上游源码**交叉编译：GOOS=windows GOARCH=arm64 CGO_ENABLED=0
           上游仓库: ${UPSTREAM}
           上游 commit: ${SHA}
+          运行期补丁: ${{ needs.check.outputs.patches }}
           版本: ${VERSION:-未知}
           构建时间: $(date -u '+%Y-%m-%d %H:%M UTC')
           签名: ${SIGN_LINE}
 
           适用：Windows 11 on ARM（ARM64 原生，不走 x64 模拟层）。
 
+          ### 本版修复（相对上游 v2.11.1）
+          1. **面板链接点不开 / 提示「无权限在 %TEMP% 目录创建文件」**
+             上游 \`OpenURL\` 用 \`rundll32 url.dll,FileProtocolHandler\`，会先在
+             %TEMP% 落临时文件再转交外壳；%TEMP% 不可写时浏览器起不来，而且
+             \`cmd.Start()\` 不检查 rundll32 是否真成功，面板表现为「点了没反应」。
+             本版改用 \`shell32!ShellExecuteW\`，全程不落盘，并按返回值如实报错。
+          2. **渠道登录失败：\`cdp: 创建临时 profile 失败 … Access is denied\`**
+             CDP 临时 profile 改为多候选：\`<exe目录>/data/tmp\` →
+             \`%LOCALAPPDATA%\\WildWork\\tmp\` → 系统临时目录；错误信息会列出
+             **实际试过且不可写**的候选路径，方便定位。
+
           ### 关于「无法验证发布者」
           这是未受信任签名的正常提示，不是文件损坏。任选其一：
-          1. 直接点「更多信息」→「仍要运行」（每次可能都提示）
+          1. 直接点「更多信息」→「仍要运行」
           2. 一次性消除：下载 WildWork-Local.cer → 右键「安装证书」→
              位置选「本地计算机」→「把所有证书放入下列存储」→ 浏览 →
-             「受信任的根证书颁发机构」→ 完成。之后重新下载 exe 即可（**必须先导入证书，
-             再下载 exe**：文件带 Mark-of-the-Web，顺序反了要重新下载一次才生效）。
+             「受信任的根证书颁发机构」→ 完成。
+             顺序很重要：**先导入证书，再下载 exe**（exe 带 Mark-of-the-Web，
+             顺序反了要重新下载一次才生效）。
+          3. 只是嫌弹窗：右键 exe → 属性 → 勾「解除锁定」→ 确定（等价于
+             PowerShell \`Unblock-File\`）。这不改变签名信任，但能去掉
+             「此文件来自 Internet」的额外警示。
 
           校验：certutil -hashfile ${BIN} SHA256  → 与 ${BIN}.sha256 对照。
           EOF

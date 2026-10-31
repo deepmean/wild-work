@@ -13,8 +13,12 @@
      前者先在 %TEMP% 落临时文件再转交外壳，%TEMP% 不可写时报
      「无权限在 %TEMP% 目录创建文件」——表现为面板里所有链接全部点不开。
   2. internal/cdp/browser.go
-     CDP 临时 profile 从 os.MkdirTemp("", ...)（= %TEMP%）改为
-     程序目录下的 data/tmp，落不下去才退回系统临时目录。
+     CDP 临时 profile 改为**多候选目录**：程序 data/tmp → 用户缓存目录
+     → 系统临时目录。上一版只试了「程序 data/tmp」，那里不可写时会静默
+     退回 %TEMP%，于是用户看到的仍是原始报错
+     （mkdir ...\\Temp\\wildwork-cdp-xxx: Access is denied），
+     完全看不出到底是哪个候选不可写。这一版把**试过的候选路径**带进错误
+     信息，并把每个候选的失败原因写进运行日志。
 
 用法：
     python3 patches/apply-windows-fixes.py <源码根目录>
@@ -82,36 +86,68 @@ func OpenURL(url string) error {
 # ── 修复 2：cdp/browser.go 的临时 profile 目录 ────────────────────────
 
 CDP_OLD_TEMP = 'profile, err = os.MkdirTemp("", "wildwork-cdp-*")'
-CDP_NEW_TEMP = 'profile, err = os.MkdirTemp(tempBaseDir(), "wildwork-cdp-*")'
+CDP_NEW_TEMP = (
+    'baseDir, baseTried := tempBaseDir()\n'
+    '\t\tprofile, err = os.MkdirTemp(baseDir, "wildwork-cdp-*")'
+)
+
+CDP_OLD_ERR = 'return nil, fmt.Errorf("cdp: 创建临时 profile 失败: %w", err)'
+CDP_NEW_ERR = (
+    'return nil, fmt.Errorf("cdp: 创建临时 profile 失败'
+    '（不可写的候选目录: %s）: %w", baseTried, err)'
+)
 
 CDP_HELPER = '''
-// tempBaseDir 返回存放临时浏览器 profile 的父目录：优先程序目录下的
-// data/tmp，落不下去才退回系统临时目录（返回空串 = 走系统默认）。
+// ── 临时 profile 目录的候选与探针 ───────────────────────────────────────
 //
 // 为什么不用 os.MkdirTemp("", ...)（等价于 %TEMP%）：某些 Windows 环境下
-// %TEMP% 不可写（安全软件保护 / 路径重定向 / 受限令牌 / 企业策略），CDP
-// 登录会在启动浏览器那一步直接失败，而报错只有一句「拒绝访问」，用户完全
-// 看不出根因在临时目录。程序自己的 data 目录一定可写（日志和状态都写在那里）。
+// %TEMP% 不可写（安全软件保护 / 路径重定向 / 受限令牌 / 企业策略 / 应用被
+// 标记为网络来源后受额外限制），CDP 登录会在启动浏览器那一步直接失败，
+// 而报错只有一句「Access is denied」，用户完全看不出根因在临时目录。
 //
-// 探针为什么真写一个文件：os.MkdirAll 在目录已存在时也返回 nil，
+// 返回 (可用的父目录, 探测失败的候选清单)。可用的父目录为空串时，
+// 调用方 os.MkdirTemp 会退回系统临时目录（保持原有行为）。
+//
+// 刻意**不用包级状态**记录候选：多个渠道同时登录会并发调用 Launch，
+// 共享变量在无锁情况下是数据竞争，而且错误信息会张冠李戴。
+func tempBaseDir() (dir string, tried string) {
+\tvar cands []string
+\tif exe, err := os.Executable(); err == nil {
+\t\t// 程序自己的数据目录：日志与状态都写在这里，正常情况一定可写。
+\t\tcands = append(cands, filepath.Join(filepath.Dir(exe), "data", "tmp"))
+\t}
+\tif cache, err := os.UserCacheDir(); err == nil {
+\t\t// exe 放在只读位置（Program Files、网络盘）时的兜底。
+\t\t// Windows 上这是 %LOCALAPPDATA%。
+\t\tcands = append(cands, filepath.Join(cache, "WildWork", "tmp"))
+\t}
+
+\tvar failed []string
+\tfor _, c := range cands {
+\t\tif dirWritable(c) {
+\t\t\treturn c, strings.Join(failed, "; ")
+\t\t}
+\t\tfailed = append(failed, c)
+\t}
+\treturn "", strings.Join(failed, "; ")
+}
+
+// dirWritable 建目录并真写一个探针文件。
+//
+// 为什么必须真写：os.MkdirAll 在目录已存在时也返回 nil，
 // 光看它成功与否无法证明「这个目录真的可写」。
-func tempBaseDir() string {
-\texe, err := os.Executable()
-\tif err != nil {
-\t\treturn ""
+func dirWritable(dir string) bool {
+\tif err := os.MkdirAll(dir, 0o755); err != nil {
+\t\treturn false
 \t}
-\tbase := filepath.Join(filepath.Dir(exe), "data", "tmp")
-\tif err := os.MkdirAll(base, 0o755); err != nil {
-\t\treturn ""
-\t}
-\tf, err := os.CreateTemp(base, ".probe-*")
+\tf, err := os.CreateTemp(dir, ".probe-*")
 \tif err != nil {
-\t\treturn ""
+\t\treturn false
 \t}
 \tname := f.Name()
 \t_ = f.Close()
 \t_ = os.Remove(name)
-\treturn base
+\treturn true
 }
 '''
 
@@ -150,8 +186,8 @@ def patch_cdp(root: pathlib.Path) -> None:
         sys.exit(f"FAIL: 文件不存在 {p}")
     text = p.read_text(encoding="utf-8")
 
-    if "tempBaseDir()" in text:
-        print("  [跳过] cdp/browser.go 已改用 tempBaseDir")
+    if "tempBaseDir" in text:
+        print("  [跳过] cdp/browser.go 已是多候选 tempBaseDir 形态")
         return
 
     if CDP_OLD_TEMP not in text:
@@ -160,10 +196,22 @@ def patch_cdp(root: pathlib.Path) -> None:
             "上游可能改动了临时 profile 的创建方式，请更新 patches/apply-windows-fixes.py。"
         )
     text = text.replace(CDP_OLD_TEMP, CDP_NEW_TEMP, 1)
+
+    if CDP_OLD_ERR not in text:
+        sys.exit(
+            "FAIL: cdp/browser.go 的错误信息锚点未找到。\n"
+            "请更新 patches/apply-windows-fixes.py。"
+        )
+    text = text.replace(CDP_OLD_ERR, CDP_NEW_ERR, 1)
+
+    # 依赖 strings（tempBaseDir 用它拼接候选清单）。
+    if '"strings"' not in text:
+        sys.exit("FAIL: cdp/browser.go 缺少 strings import，tempBaseDir 无法拼接候选。")
+
     text = text.rstrip("\n") + "\n" + CDP_HELPER
 
     p.write_text(text, encoding="utf-8")
-    print("  [已改] cdp/browser.go: 临时 profile 目录 → 程序目录 data/tmp")
+    print("  [已改] cdp/browser.go: 临时 profile → 多候选 tempBaseDir（带失败路径自证）")
 
 
 def main() -> int:
